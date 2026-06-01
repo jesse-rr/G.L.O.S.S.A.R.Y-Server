@@ -1,0 +1,12 @@
+{
+  "name": "glossary-lobby-server",
+  "version": "1.0.0",
+  "description": "Lobby & signaling server for G.L.O.S.S.A.R.Y.",
+  "main": "lobby-server.js",
+  "scripts": {
+    "start": "node lobby-server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
