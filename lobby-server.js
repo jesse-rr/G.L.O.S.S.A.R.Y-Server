@@ -1,8 +1,8 @@
 const http = require('http');
 
 const PORT = 3000;
-let rooms = [];
-let signals = [];
+let rooms = [];           // each room: { id, title, isPrivate, currentPlayers, maxPlayers, passcode, hostPeerId, lastSeen }
+let signals = [];         // each signal: { id, roomId, from, to, type, payload, createdAt }
 
 // Helper to send JSON response with CORS headers
 const sendJson = (res, status, data) => {
@@ -28,6 +28,30 @@ const readJsonBody = (req, onBody, onError) => {
     });
 };
 
+// Extract original room id from the full signal roomId (e.g., "glossary-game-abc123" -> "abc123")
+const extractOriginalRoomId = (fullRoomId) => {
+    const prefix = 'glossary-game-';
+    if (fullRoomId.startsWith(prefix)) {
+        return fullRoomId.slice(prefix.length);
+    }
+    return fullRoomId;
+};
+
+// Find room by its original id OR full signal roomId
+const findRoomByAnyId = (searchId) => {
+    const originalId = extractOriginalRoomId(searchId);
+    return rooms.find(r => r.id === originalId || `glossary-game-${r.id}` === searchId);
+};
+
+// Verify passcode for a room (if room is private)
+const verifyPasscode = (req, room) => {
+    if (!room) return false;
+    // If room is not private, any passcode (or none) is accepted? Actually game uses passcode for all rooms.
+    // The client always sends x-passcode. We'll require exact match for all rooms.
+    const clientPasscode = req.headers['x-passcode'];
+    return clientPasscode && clientPasscode === room.passcode;
+};
+
 const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -37,13 +61,15 @@ const server = http.createServer((req, res) => {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, x-passcode',
-            'Access-Control-Max-Age': '86400'   // cache preflight for 1 day
+            'Access-Control-Max-Age': '86400'
         });
         res.end();
         return;
     }
 
     // ----- Rooms API -----
+
+    // GET /rooms - list public rooms (no passcode required)
     if (req.method === 'GET' && url.pathname === '/rooms') {
         const safeRooms = rooms.map(r => ({
             id: r.id,
@@ -51,18 +77,41 @@ const server = http.createServer((req, res) => {
             isPrivate: r.isPrivate,
             currentPlayers: r.currentPlayers,
             maxPlayers: r.maxPlayers,
-            passcode: r.isPrivate ? null : r.passcode
+            passcode: r.isPrivate ? null : r.passcode   // hide passcode for private rooms
         }));
         sendJson(res, 200, safeRooms);
         return;
     }
 
+    // POST /rooms - create or update room (requires passcode in body)
     if (req.method === 'POST' && url.pathname === '/rooms') {
-        readJsonBody(req, (room) => {
-            room.lastSeen = Date.now();
-            const existing = rooms.findIndex(r => r.id === room.id);
-            if (existing >= 0) {
-                rooms[existing] = room;
+        readJsonBody(req, (roomData) => {
+            if (!roomData.id || !roomData.passcode) {
+                sendJson(res, 400, { success: false, error: 'Missing id or passcode' });
+                return;
+            }
+
+            const existingIndex = rooms.findIndex(r => r.id === roomData.id);
+            const room = {
+                id: roomData.id,
+                title: roomData.title || 'Untitled Room',
+                isPrivate: roomData.isPrivate === true,
+                currentPlayers: roomData.currentPlayers || 1,
+                maxPlayers: roomData.maxPlayers || 3,
+                passcode: roomData.passcode,
+                hostPeerId: roomData.hostPeerId || '',
+                lastSeen: Date.now()
+            };
+
+            if (existingIndex >= 0) {
+                // Update: only allow if passcode matches (or if no existing passcode? For safety require match)
+                const existingRoom = rooms[existingIndex];
+                const clientPasscode = roomData.passcode;
+                if (existingRoom.passcode !== clientPasscode) {
+                    sendJson(res, 403, { success: false, error: 'Invalid passcode for room update' });
+                    return;
+                }
+                rooms[existingIndex] = room;
             } else {
                 rooms.push(room);
             }
@@ -71,36 +120,71 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // DELETE /rooms/:id - delete room (requires passcode in x-passcode header)
     if (req.method === 'DELETE' && url.pathname.startsWith('/rooms/')) {
         const id = decodeURIComponent(url.pathname.split('/')[2] || '');
+        const room = rooms.find(r => r.id === id);
+        if (!room) {
+            sendJson(res, 404, { success: false, error: 'Room not found' });
+            return;
+        }
+        if (!verifyPasscode(req, room)) {
+            sendJson(res, 403, { success: false, error: 'Invalid passcode' });
+            return;
+        }
         rooms = rooms.filter(r => r.id !== id);
-        signals = signals.filter(signal => signal.roomId !== `glossary-game-${id.toLowerCase()}`);
+        // Also clear signals for this room (both forms)
+        const fullRoomId = `glossary-game-${id.toLowerCase()}`;
+        signals = signals.filter(s => s.roomId !== fullRoomId && s.roomId !== id);
         sendJson(res, 200, { success: true });
         return;
     }
 
-    // ----- Signalling API -----
+    // ----- Signalling API (all require passcode verification) -----
+
+    // GET /signals/:roomId?peerId=xxx
     if (req.method === 'GET' && url.pathname.startsWith('/signals/')) {
-        const roomId = decodeURIComponent(url.pathname.split('/')[2] || '');
+        const fullRoomId = decodeURIComponent(url.pathname.split('/')[2] || '');
         const peerId = url.searchParams.get('peerId');
-        if (!roomId || !peerId) {
+        if (!fullRoomId || !peerId) {
             sendJson(res, 400, { success: false, error: 'Missing roomId or peerId' });
             return;
         }
 
+        const room = findRoomByAnyId(fullRoomId);
+        if (!room) {
+            sendJson(res, 404, { success: false, error: 'Room not found' });
+            return;
+        }
+        if (!verifyPasscode(req, room)) {
+            sendJson(res, 403, { success: false, error: 'Invalid passcode' });
+            return;
+        }
+
         const visibleSignals = signals.filter(signal => (
-            signal.roomId === roomId
-            && signal.from !== peerId
-            && (!signal.to || signal.to === peerId)
+            signal.roomId === fullRoomId &&
+            signal.from !== peerId &&
+            (!signal.to || signal.to === peerId)
         ));
         sendJson(res, 200, visibleSignals);
         return;
     }
 
+    // POST /signals/:roomId
     if (req.method === 'POST' && url.pathname.startsWith('/signals/')) {
-        const roomId = decodeURIComponent(url.pathname.split('/')[2] || '');
-        if (!roomId) {
+        const fullRoomId = decodeURIComponent(url.pathname.split('/')[2] || '');
+        if (!fullRoomId) {
             sendJson(res, 400, { success: false, error: 'Missing roomId' });
+            return;
+        }
+
+        const room = findRoomByAnyId(fullRoomId);
+        if (!room) {
+            sendJson(res, 404, { success: false, error: 'Room not found' });
+            return;
+        }
+        if (!verifyPasscode(req, room)) {
+            sendJson(res, 403, { success: false, error: 'Invalid passcode' });
             return;
         }
 
@@ -112,7 +196,7 @@ const server = http.createServer((req, res) => {
 
             signals.push({
                 id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                roomId,
+                roomId: fullRoomId,
                 from: signal.from,
                 to: signal.to || null,
                 type: signal.type,
@@ -124,13 +208,30 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // DELETE /signals/:roomId/:peerId
     if (req.method === 'DELETE' && url.pathname.startsWith('/signals/')) {
-        const [, , roomIdRaw, peerIdRaw] = url.pathname.split('/');
-        const roomId = decodeURIComponent(roomIdRaw || '');
-        const peerId = decodeURIComponent(peerIdRaw || '');
+        const parts = url.pathname.split('/');
+        const fullRoomId = decodeURIComponent(parts[2] || '');
+        const peerId = decodeURIComponent(parts[3] || '');
+
+        if (!fullRoomId) {
+            sendJson(res, 400, { success: false, error: 'Missing roomId' });
+            return;
+        }
+
+        const room = findRoomByAnyId(fullRoomId);
+        if (!room) {
+            sendJson(res, 404, { success: false, error: 'Room not found' });
+            return;
+        }
+        if (!verifyPasscode(req, room)) {
+            sendJson(res, 403, { success: false, error: 'Invalid passcode' });
+            return;
+        }
+
         signals = signals.filter(signal => (
-            signal.roomId !== roomId
-            || (peerId && signal.from !== peerId && signal.to !== peerId)
+            signal.roomId !== fullRoomId ||
+            (peerId && signal.from !== peerId && signal.to !== peerId)
         ));
         sendJson(res, 200, { success: true });
         return;
@@ -142,7 +243,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Lobby Server running at http://0.0.0.0:${PORT}`);
+    console.log(`Lobby Server with passcode verification running at http://0.0.0.0:${PORT}`);
 });
 
 // Cleanup stale rooms and signals every 5 seconds
