@@ -4,11 +4,18 @@ const PORT = 3000;
 let rooms = [];
 let signals = [];
 
+// Helper to send JSON response with CORS headers
 const sendJson = (res, status, data) => {
-    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.writeHead(status, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, x-passcode'
+    });
     res.end(JSON.stringify(data));
 };
 
+// Helper to read JSON body
 const readJsonBody = (req, onBody, onError) => {
     let body = '';
     req.on('data', chunk => body += chunk.toString());
@@ -24,16 +31,19 @@ const readJsonBody = (req, onBody, onError) => {
 const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
+    // Handle CORS preflight (OPTIONS)
     if (req.method === 'OPTIONS') {
-        res.writeHead(204);
+        res.writeHead(204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, x-passcode',
+            'Access-Control-Max-Age': '86400'   // cache preflight for 1 day
+        });
         res.end();
         return;
     }
 
+    // ----- Rooms API -----
     if (req.method === 'GET' && url.pathname === '/rooms') {
         const safeRooms = rooms.map(r => ({
             id: r.id,
@@ -69,6 +79,7 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ----- Signalling API -----
     if (req.method === 'GET' && url.pathname.startsWith('/signals/')) {
         const roomId = decodeURIComponent(url.pathname.split('/')[2] || '');
         const peerId = url.searchParams.get('peerId');
@@ -125,14 +136,16 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    res.writeHead(404);
-    res.end();
+    // 404 for unknown routes
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Lobby Server running at http://0.0.0.0:${PORT}`);
 });
 
+// Cleanup stale rooms and signals every 5 seconds
 setInterval(() => {
     const now = Date.now();
     const beforeCount = rooms.length;
